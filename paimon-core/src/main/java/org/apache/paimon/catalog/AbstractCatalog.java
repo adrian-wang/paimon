@@ -336,8 +336,25 @@ public abstract class AbstractCatalog implements Catalog {
             }
             return table;
         } else {
-            return getDataTable(identifier);
+            try {
+                return getDataTable(identifier);
+            } catch (TableNotExistException e) {
+                SupportsExternalTables etCatalog = toExternalTableCatalog();
+                if (etCatalog != null) {
+                    return etCatalog.getExternalTable(identifier);
+                }
+                throw e;
+            }
         }
+    }
+
+    @Nullable
+    private SupportsExternalTables toExternalTableCatalog() {
+        if (this instanceof SupportsExternalTables
+                && ((SupportsExternalTables) this).enableExternalTables()) {
+            return (SupportsExternalTables) this;
+        }
+        return null;
     }
 
     private FileStoreTable getDataTable(Identifier identifier) throws TableNotExistException {

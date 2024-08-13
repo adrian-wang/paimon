@@ -85,5 +85,11 @@ public final class HiveCatalogOptions {
                                                             + "E.g. specifying \"conf:a.b.c\" will add \"a.b.c\" to the key, and so that configurations with different default catalog wouldn't share the same client pool. Multiple conf elements can be specified."))
                                     .build());
 
+    public static final ConfigOption<Boolean> FORMAT_TABLE_ENABLED =
+            ConfigOptions.key("format-table-enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("");
+
     private HiveCatalogOptions() {}
 }
