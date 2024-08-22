@@ -47,6 +47,7 @@ import org.apache.paimon.table.FormatTable;
 import org.apache.paimon.table.TableType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
 
 import org.apache.flink.table.hive.LegacyHiveClasses;
 import org.apache.hadoop.conf.Configuration;
@@ -468,6 +469,42 @@ public class HiveCatalog extends AbstractCatalog implements SupportsExternalTabl
             throw new RuntimeException(e);
         }
         return HiveFormatTableUtils.convertToExternalTable(table);
+    }
+
+    public void createExternalTable(
+            Identifier identifier, Schema schema, String location, boolean ignoreIfExists)
+            throws Catalog.TableAlreadyExistException, Catalog.DatabaseNotExistException {
+        List<DataField> fields = schema.fields();
+        List<String> partitionKeys = schema.partitionKeys();
+        List<String> primaryKeys = schema.primaryKeys();
+        Map<String, String> options = schema.options();
+        int highestFieldId = RowType.currentHighestFieldId(fields);
+
+        TableSchema newSchema =
+                new TableSchema(
+                        0,
+                        fields,
+                        highestFieldId,
+                        partitionKeys,
+                        primaryKeys,
+                        options,
+                        schema.comment());
+        try {
+            Table hiveTable = createHiveTable(identifier, newSchema);
+            hiveTable.setTableType("EXTERNAL_TABLE");
+            hiveTable.putToParameters("EXTERNAL", "TRUE");
+            hiveTable.putToParameters("external", "true");
+            hiveTable.putToParameters("location", location);
+            clients.execute(client -> client.createTable(hiveTable));
+        } catch (Exception e) {
+            Path path = getTableLocation(identifier);
+            try {
+                fileIO.deleteDirectoryQuietly(path);
+            } catch (Exception ee) {
+                LOG.error("Delete directory[{}] fail for table {}", path, identifier, ee);
+            }
+            throw new RuntimeException("Failed to create table " + identifier.getFullName(), e);
+        }
     }
 
     private boolean usingExternalTable() {

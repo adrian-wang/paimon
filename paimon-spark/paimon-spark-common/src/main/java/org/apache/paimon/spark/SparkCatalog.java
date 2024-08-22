@@ -22,31 +22,40 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.SupportsExternalTables;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.spark.catalog.SparkBaseCatalog;
+import org.apache.paimon.table.FormatTable;
 
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.TableIdentifier;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
+import org.apache.spark.sql.catalyst.catalog.CatalogStorageFormat;
+import org.apache.spark.sql.catalyst.catalog.CatalogTable;
+import org.apache.spark.sql.catalyst.catalog.CatalogTableType;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.NamespaceChange;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
+import org.apache.spark.sql.connector.catalog.V1Table;
 import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.IdentityTransform;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.internal.SessionState;
+import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -230,7 +239,8 @@ public class SparkCatalog extends SparkBaseCatalog {
     }
 
     @Override
-    public SparkTable loadTable(Identifier ident) throws NoSuchTableException {
+    public org.apache.spark.sql.connector.catalog.Table loadTable(Identifier ident)
+            throws NoSuchTableException {
         return loadSparkTable(ident, Collections.emptyMap());
     }
 
@@ -239,8 +249,9 @@ public class SparkCatalog extends SparkBaseCatalog {
      */
     public SparkTable loadTable(Identifier ident, String version) throws NoSuchTableException {
         LOG.info("Time travel to version '{}'.", version);
-        return loadSparkTable(
-                ident, Collections.singletonMap(CoreOptions.SCAN_VERSION.key(), version));
+        return (SparkTable)
+                loadSparkTable(
+                        ident, Collections.singletonMap(CoreOptions.SCAN_VERSION.key(), version));
     }
 
     /**
@@ -253,10 +264,12 @@ public class SparkCatalog extends SparkBaseCatalog {
         // Paimon's timestamp use millisecond
         timestamp = timestamp / 1000;
         LOG.info("Time travel target timestamp is {} milliseconds.", timestamp);
-        return loadSparkTable(
-                ident,
-                Collections.singletonMap(
-                        CoreOptions.SCAN_TIMESTAMP_MILLIS.key(), String.valueOf(timestamp)));
+        return (SparkTable)
+                loadSparkTable(
+                        ident,
+                        Collections.singletonMap(
+                                CoreOptions.SCAN_TIMESTAMP_MILLIS.key(),
+                                String.valueOf(timestamp)));
     }
 
     @Override
@@ -284,20 +297,34 @@ public class SparkCatalog extends SparkBaseCatalog {
     }
 
     @Override
-    public SparkTable createTable(
+    public org.apache.spark.sql.connector.catalog.Table createTable(
             Identifier ident,
             StructType schema,
             Transform[] partitions,
             Map<String, String> properties)
             throws TableAlreadyExistsException, NoSuchNamespaceException {
         try {
-            String provider = properties.get(TableCatalog.PROP_PROVIDER);
-            checkArgument(
-                    usePaimon(provider),
-                    "SparkCatalog can only create paimon table, but current provider is %s",
-                    provider);
-            catalog.createTable(
-                    toIdentifier(ident), toInitialSchema(schema, partitions, properties), false);
+            if (properties.containsKey("external") && catalog instanceof SupportsExternalTables) {
+                SupportsExternalTables formatTableCatalog = (SupportsExternalTables) catalog;
+                String location = properties.get("location");
+                checkArgument(location != null, "external location should not be null");
+                formatTableCatalog.createExternalTable(
+                        toIdentifier(ident),
+                        toInitialSchema(schema, partitions, properties),
+                        location,
+                        false);
+
+            } else {
+                String provider = properties.get(TableCatalog.PROP_PROVIDER);
+                checkArgument(
+                        usePaimon(provider),
+                        "SparkCatalog can only create paimon table, but current provider is %s",
+                        provider);
+                catalog.createTable(
+                        toIdentifier(ident),
+                        toInitialSchema(schema, partitions, properties),
+                        false);
+            }
             return loadTable(ident);
         } catch (Catalog.TableAlreadyExistException e) {
             throw new TableAlreadyExistsException(ident);
@@ -455,11 +482,76 @@ public class SparkCatalog extends SparkBaseCatalog {
         return new org.apache.paimon.catalog.Identifier(ident.namespace()[0], ident.name());
     }
 
-    protected SparkTable loadSparkTable(Identifier ident, Map<String, String> extraOptions)
-            throws NoSuchTableException {
+    protected org.apache.spark.sql.connector.catalog.Table loadSparkTable(
+            Identifier ident, Map<String, String> extraOptions) throws NoSuchTableException {
         try {
-            return new SparkTable(
-                    copyWithSQLConf(catalog.getTable(toIdentifier(ident)), extraOptions));
+            org.apache.paimon.table.Table paimonTable = catalog.getTable(toIdentifier(ident));
+            if (paimonTable instanceof FormatTable) {
+                FormatTable formatTable = (FormatTable) paimonTable;
+                URI tableUri = URI.create(formatTable.location());
+                scala.collection.immutable.Map<String, String> scalaMap =
+                        scala.collection.JavaConverters.mapAsScalaMap(formatTable.options())
+                                .toMap(scala.Predef.<scala.Tuple2<String, String>>conforms());
+                CatalogStorageFormat format =
+                        new CatalogStorageFormat(
+                                scala.Option.apply(tableUri),
+                                // TODO hard code
+                                scala.Option.apply("org.apache.hadoop.mapred.TextInputFormat"),
+                                scala.Option.apply(
+                                        "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"),
+                                scala.Option.apply(
+                                        "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
+                                false,
+                                scalaMap);
+                StructField[] sfs = new StructField[formatTable.rowType().getFieldCount()];
+                for (int i = 0; i < sfs.length; i++) {
+                    DataType dt =
+                            DataType.fromDDL(
+                                    formatTable.rowType().getFieldTypes().get(i).asSQLString());
+                    sfs[i] =
+                            new StructField(
+                                    formatTable.rowType().getFieldNames().get(i), dt, true, null);
+                }
+                StructType schema = new StructType(sfs);
+                String dbname = defaultDatabase;
+                if (ident.namespace().length > 1) {
+                    dbname = ident.namespace()[0];
+                }
+                scala.collection.immutable.Map<String, String> emptyMap =
+                        scala.collection.JavaConverters.mapAsScalaMap(new HashMap<String, String>())
+                                .toMap(scala.Predef.<scala.Tuple2<String, String>>conforms());
+                scala.collection.Seq<String> emptySeq =
+                        scala.collection.JavaConverters.asScalaBuffer(new ArrayList<String>())
+                                .toSeq();
+                TableIdentifier tableIdentifier =
+                        new TableIdentifier(
+                                ident.name(),
+                                scala.Option.apply(dbname),
+                                scala.Option.apply(catalogName));
+                return new V1Table(
+                        CatalogTable.apply(
+                                tableIdentifier,
+                                CatalogTableType.EXTERNAL(),
+                                format,
+                                schema,
+                                scala.Option.empty(),
+                                emptySeq,
+                                scala.Option.empty(),
+                                "hadoop",
+                                System.currentTimeMillis(),
+                                -1,
+                                "",
+                                emptyMap,
+                                scala.Option.empty(),
+                                scala.Option.empty(),
+                                scala.Option.empty(),
+                                emptySeq,
+                                false,
+                                true,
+                                emptyMap,
+                                scala.Option.empty()));
+            }
+            return new SparkTable(copyWithSQLConf(paimonTable, extraOptions));
         } catch (Catalog.TableNotExistException e) {
             throw new NoSuchTableException(ident);
         }

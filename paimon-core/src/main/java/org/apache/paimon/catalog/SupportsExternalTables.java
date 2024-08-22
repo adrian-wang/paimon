@@ -18,6 +18,7 @@
 
 package org.apache.paimon.catalog;
 
+import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.ExternalTable;
 import org.apache.paimon.table.FormatTable;
 
@@ -35,4 +36,18 @@ public interface SupportsExternalTables {
      * @throws Catalog.TableNotExistException if the target does not exist
      */
     ExternalTable getExternalTable(Identifier identifier) throws Catalog.TableNotExistException;
+
+    /**
+     * Create a {@link FormatTable} identified by the given {@link Identifier}.
+     *
+     * @param identifier Path of the table
+     * @param schema Schema of the table
+     * @param location Location of the table
+     * @param ignoreIfExists Whether to ignore the operation if the table already exists
+     * @throws Catalog.TableAlreadyExistException if the target already exists
+     * @throws Catalog.DatabaseNotExistException if the database of the target does not exist
+     */
+    void createExternalTable(
+            Identifier identifier, Schema schema, String location, boolean ignoreIfExists)
+            throws Catalog.TableAlreadyExistException, Catalog.DatabaseNotExistException;
 }
